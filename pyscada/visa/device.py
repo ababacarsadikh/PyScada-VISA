@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
 
+import paho.mqtt.client as mqtt
 from pyscada.device import GenericDevice
 from .devices import GenericDevice as GenericHandlerDevice
 
+
 try:
-    import pyvisa
+    import paho.mqtt.client as mqtt_client
 
     driver_ok = True
 except ImportError:
@@ -23,44 +25,69 @@ class Device(GenericDevice):
         self.handler_class = GenericHandlerDevice
         super().__init__(device)
 
+        self._address = device.mqttbroker.address
+        self._port = device.mqttbroker.port
+        self._timeout = device.mqttbroker.timeout
+        
+        self.mqtt_client = None
+        self.variables = {}
+
         for var in self.device.variable_set.filter(active=1):
-            if not hasattr(var, "visavariable"):
+            if not hasattr(var, "mqttvariable"):
                 continue
             self.variables[var.pk] = var
 
         if self.driver_ok and self.driver_handler_ok:
             self._h.connect()
         else:
-            logger.warning(f"Cannot import visa or handler for {self.device}")
+            logger.warning(f"Cannot import mqtt or handler for {self.device}")
 
-    def write_data(self, variable_id, value, task):
+    def write_data(self, topic, value, task):
         """
         write value to the instrument/device
         """
         output = []
         if not self.driver_ok:
-            logger.info("Cannot import visa")
+            logger.info("Cannot import MQTT client")
             return output
+
         for item in self.variables.values():
-            if not (item.visavariable.variable_type == 0 and item.id == variable_id):
-                # skip all config values
+            if not (item.mqttvariable.variable_type == 0 and item.id == variable_id):
                 continue
-            # read_value = self._h.write_data(item.visavariable.device_property, value)
-            read_value = self._h.write_data(variable_id, value, task)
-            if read_value is not None and item.update_values([read_value], [time()]):
-                output.append(item)
-            else:
-                logger.info(f"Visa-Output not ok : {output}")
-        return output
+            
+            topic = item.mqttvariable.topic
+            self._h.publish(topic, value)
+            logger.info(f"Published to {topic}: {value}")
+            output.append(item)
+
 
     def request_data(self):
         """
         request data from the instrument/device
         """
+        
         output = []
-        if not self.driver_ok:
-            logger.info("Cannot import visa")
-            return output
+        keys_to_reset = []
+        for variable_id, variable in self.variables.items():
+            if self.data.get(variable.mqttvariable.topic) is not None:
+                value = self.data[variable.mqttvariable.topic].decode("utf-8")
+                value = variable.mqttvariable.parse_value(value)
+                timestamp = time()
+                
+                if variable.mqttvariable.timestamp_topic:
+                    if self.data.get(variable.mqttvariable.timestamp_topic) is None:
+                        logger.debug("MQTT request_data timestamp_topic is None")
+                        continue
+                    timestamp = self.data[variable.mqttvariable.timestamp_topic].decode("utf-8")
+                    timestamp = variable.mqttvariable.parse_timestamp(timestamp)
+                    keys_to_reset.append(variable.mqttvariable.timestamp_topic)
+                
+                self.data[variable.mqttvariable.topic] = None
 
-        output = super().request_data()
+                if variable.update_values([value], [timestamp]):
+                    output.append(variable)
+        
+        for key in keys_to_reset:
+            self.data[key] = None
+        
         return output
